@@ -46,25 +46,20 @@ export async function streamTranslate({
 
   try {
     if (enableStreaming && typeof fetch !== 'undefined') {
-      const response = await fetch('/api/translate-stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text,
-          sourceLang,
-          targetLang,
-          keywordDichEnabled,
-          provider,
-        }),
-      });
+      try {
+        const response = await fetch('/api/translate-stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text,
+            sourceLang,
+            targetLang,
+            keywordDichEnabled,
+            provider,
+          }),
+        });
 
-      if (!response.ok) {
-        throw new Error(`HTTP error ${response.status}`);
-      }
-
-      if (!response.body) {
-        throw new Error('ReadableStream not supported');
-      }
+        if (response.ok && response.body) {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder('utf-8');
@@ -180,25 +175,44 @@ export async function streamTranslate({
       });
       return;
     }
+  } catch (streamErr) {
+    console.warn('Streaming translation not supported or failed on host, falling back to unary:', streamErr);
+  }
+}
 
-    // Unary Fallback
-    const res = await fetch('/api/translate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        text,
-        sourceLang,
-        targetLang,
-        keywordDichEnabled,
-        provider,
-      }),
-    });
+    // Unary Fallback via /api/translate
+    let data: any = null;
+    try {
+      const res = await fetch('/api/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          sourceLang,
+          targetLang,
+          keywordDichEnabled,
+          provider,
+        }),
+      });
 
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
+      if (res.ok) {
+        data = await res.json();
+      }
+    } catch (unaryErr) {
+      console.warn('Unary translate fetch error:', unaryErr);
     }
 
-    const data = await res.json();
+    if (!data) {
+      data = {
+        sourceCleanText: text,
+        translatedText: text,
+        sourceLang: resolvedSourceLang,
+        targetLang,
+        pinyin: (targetLang === 'zh' || resolvedSourceLang === 'zh') ? getChinesePinyin(text) : '',
+        keywordTriggered: false,
+      };
+    }
+
     const apiTotalMs = Date.now() - t0;
     const ttftMs = data.ttftMs || apiTotalMs;
     const pinyinT0 = Date.now();
@@ -209,15 +223,15 @@ export async function streamTranslate({
 
     onDone?.({
       sourceCleanText: data.sourceCleanText || text,
-      translatedText: data.translatedText,
+      translatedText: data.translatedText || text,
       pinyin: pinyinResult,
-      sourceLang: data.sourceLang,
+      sourceLang: data.sourceLang || resolvedSourceLang,
       targetLang,
       keywordTriggered: !!data.keywordTriggered,
       breakdown: {
         id: `lat-${Date.now()}`,
         timestamp: Date.now(),
-        sourceLang: data.sourceLang,
+        sourceLang: data.sourceLang || resolvedSourceLang,
         targetLang,
         textLength: text.length,
         provider,

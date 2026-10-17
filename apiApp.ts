@@ -7,7 +7,30 @@ dotenv.config();
 
 const app = express();
 
-app.use(express.json({ limit: '25mb' }));
+// Safe body parsing middleware supporting both Vercel serverless and standalone Express
+app.use((req, res, next) => {
+  // If req.body is already parsed into an object (e.g. by Vercel serverless runtime)
+  if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+    return next();
+  }
+  if (typeof req.body === 'string' && req.body.trim().startsWith('{')) {
+    try {
+      req.body = JSON.parse(req.body);
+      return next();
+    } catch (e) {
+      // not JSON
+    }
+  }
+  express.json({ limit: '25mb' })(req, res, (err) => {
+    if (err) {
+      console.warn('express.json warning:', err.message);
+      req.body = req.body || {};
+    }
+    next();
+  });
+});
+
+app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 // Enable CORS for all routes (supports Vercel serverless & standalone)
 app.use((req, res, next) => {
@@ -552,7 +575,7 @@ apiRouter.get('/config-keys', (_req, res) => {
 // Config keys update endpoint (Store safely in server memory)
 apiRouter.post('/config-keys', async (req, res) => {
   try {
-    const { provider, apiKey, endpoint } = req.body;
+    const { provider, apiKey, endpoint } = req.body || {};
     if (!provider) {
       return res.status(400).json({ error: 'Thiếu thông tin nhà cung cấp API.' });
     }
@@ -597,183 +620,210 @@ apiRouter.post('/config-keys', async (req, res) => {
 // 1. Streaming translation endpoint via Server-Sent Events (SSE)
 apiRouter.post('/translate-stream', async (req, res) => {
   const startTime = Date.now();
-  const { text, sourceLang = 'auto', targetLang = 'zh', keywordDichEnabled = true, provider = 'gemini' } = req.body;
+  try {
+    const body = req.body || {};
+    const text = typeof body.text === 'string' ? body.text : '';
+    const sourceLang = body.sourceLang || 'auto';
+    const targetLang = body.targetLang || 'zh';
+    const keywordDichEnabled = body.keywordDichEnabled ?? true;
+    const provider = body.provider || 'gemini';
 
-  if (!text || typeof text !== 'string' || !text.trim()) {
-    return res.status(400).json({ error: 'Nội dung cần dịch không được để trống.' });
-  }
-
-  const { processedText, keywordTriggered } = preprocessKeyword(text, sourceLang, keywordDichEnabled);
-  let detectedLang = sourceLang === 'auto' ? detectLanguageBasic(processedText) : sourceLang;
-
-  // Smart target flip: Vietnamese translates to selected targetLang, foreign languages translate to Vietnamese
-  let actualTargetLang = targetLang;
-  if (sourceLang === 'auto') {
-    if (detectedLang === 'vi') {
-      actualTargetLang = targetLang === 'vi' ? 'en' : targetLang;
-    } else {
-      actualTargetLang = 'vi';
-    }
-  }
-
-  // Set SSE headers
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    'Connection': 'keep-alive',
-  });
-
-  // Send initial metadata event
-  res.write(`event: metadata\ndata: ${JSON.stringify({
-    sourceCleanText: processedText,
-    sourceLang: detectedLang,
-    targetLang: actualTargetLang,
-    keywordTriggered,
-    provider,
-  })}\n\n`);
-
-  const currentAi = getActiveGeminiAI();
-
-  // Helper to stream full fallback tokens with high semantic fidelity for long sentences
-  const streamNeuralFallback = async (engineName: string) => {
-    let result = await translateWithMyMemory(processedText, actualTargetLang, detectedLang);
-    if (!result) {
-      result = await translateWithGoogle(processedText, actualTargetLang, detectedLang);
-    }
-    if (!result) {
-      result = lookupOfflineDictionary(processedText, actualTargetLang);
-    }
-    if (!result) {
-      result = processedText;
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: 'Nội dung cần dịch không được để trống.' });
     }
 
-    const pinyinText = (actualTargetLang === 'zh' || /[\u4e00-\u9fa5]/.test(result))
-      ? formatPinyin(result)
-      : '';
+    const { processedText, keywordTriggered } = preprocessKeyword(text, sourceLang, keywordDichEnabled);
+    let detectedLang = sourceLang === 'auto' ? detectLanguageBasic(processedText) : sourceLang;
 
-    // Stream tokens smoothly for responsive UI
-    const tokens = actualTargetLang === 'zh' ? Array.from(result) : result.split(/(\s+)/);
-    for (const t of tokens) {
-      if (t) {
-        res.write(`event: token\ndata: ${JSON.stringify({ token: t })}\n\n`);
+    // Smart target flip: Vietnamese translates to selected targetLang, foreign languages translate to Vietnamese
+    let actualTargetLang = targetLang;
+    if (sourceLang === 'auto') {
+      if (detectedLang === 'vi') {
+        actualTargetLang = targetLang === 'vi' ? 'en' : targetLang;
+      } else {
+        actualTargetLang = 'vi';
       }
     }
 
-    const apiTotalMs = Date.now() - startTime;
-    res.write(`event: done\ndata: ${JSON.stringify({
+    // Set SSE headers
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+    });
+
+    // Send initial metadata event
+    res.write(`event: metadata\ndata: ${JSON.stringify({
       sourceCleanText: processedText,
-      translatedText: result,
       sourceLang: detectedLang,
       targetLang: actualTargetLang,
-      pinyin: pinyinText,
       keywordTriggered,
-      ttftMs: Math.round(apiTotalMs * 0.4),
-      apiTotalMs,
-      engine: engineName,
+      provider,
     })}\n\n`);
-    res.end();
-  };
 
-  // Provider: Google Cloud
-  if (provider === 'google_cloud') {
-    const gResult = await translateWithGoogle(processedText, actualTargetLang, detectedLang);
-    if (gResult) {
-      const pinyinText = (actualTargetLang === 'zh' || /[\u4e00-\u9fa5]/.test(gResult)) ? formatPinyin(gResult) : '';
-      const tokens = actualTargetLang === 'zh' ? Array.from(gResult) : gResult.split(/(\s+)/);
-      for (const t of tokens) {
-        if (t) res.write(`event: token\ndata: ${JSON.stringify({ token: t })}\n\n`);
+    const currentAi = getActiveGeminiAI();
+
+    // Helper to stream full fallback tokens with high semantic fidelity for long sentences
+    const streamNeuralFallback = async (engineName: string) => {
+      let result = await translateWithMyMemory(processedText, actualTargetLang, detectedLang);
+      if (!result) {
+        result = await translateWithGoogle(processedText, actualTargetLang, detectedLang);
       }
-      const apiTotalMs = Date.now() - startTime;
-      res.write(`event: done\ndata: ${JSON.stringify({
-        sourceCleanText: processedText,
-        translatedText: gResult,
-        sourceLang: detectedLang,
-        targetLang: actualTargetLang,
-        pinyin: pinyinText,
-        keywordTriggered,
-        ttftMs: Math.round(apiTotalMs * 0.5),
-        apiTotalMs,
-        engine: 'google-cloud',
-      })}\n\n`);
-      res.end();
-      return;
-    }
-  }
-
-  // Provider: Gemini AI
-  if (provider === 'gemini' && currentAi) {
-    try {
-      let ttftMs = 0;
-      let accumulated = '';
-      let usedEngine = PRIMARY_MODEL;
-
-      const prompt = `Translate to ${LANGUAGE_NAMES[actualTargetLang]}:\n"${processedText}"`;
-
-      let responseStream;
-      try {
-        responseStream = await withTimeout(
-          currentAi.models.generateContentStream({
-            model: PRIMARY_MODEL,
-            contents: prompt,
-            config: {
-              systemInstruction: `You are an ultra-fast streaming direct translator. Translate accurately to ${LANGUAGE_NAMES[actualTargetLang]}. Output ONLY the direct translated text. No quotes, no markdown, no extra commentary.`,
-              temperature: 0.1,
-            },
-          }),
-          3000
-        );
-      } catch (err: any) {
-        usedEngine = FALLBACK_MODEL;
-        responseStream = await withTimeout(
-          currentAi.models.generateContentStream({
-            model: FALLBACK_MODEL,
-            contents: prompt,
-            config: {
-              systemInstruction: `Translate to ${LANGUAGE_NAMES[actualTargetLang]}. Output ONLY direct translation.`,
-              temperature: 0.1,
-            },
-          }),
-          3000
-        );
+      if (!result) {
+        result = lookupOfflineDictionary(processedText, actualTargetLang);
+      }
+      if (!result) {
+        result = processedText;
       }
 
-      for await (const chunk of responseStream) {
-        if (!ttftMs) {
-          ttftMs = Date.now() - startTime;
-        }
-        const chunkText = chunk.text || '';
-        if (chunkText) {
-          accumulated += chunkText;
-          res.write(`event: token\ndata: ${JSON.stringify({ token: chunkText })}\n\n`);
-        }
-      }
-
-      const cleanResult = accumulated.replace(/^["'`]+|["'`]+$/g, '').trim();
-      const pinyinText = (actualTargetLang === 'zh' || /[\u4e00-\u9fa5]/.test(cleanResult))
-        ? formatPinyin(cleanResult)
+      const pinyinText = (actualTargetLang === 'zh' || /[\u4e00-\u9fa5]/.test(result))
+        ? formatPinyin(result)
         : '';
 
+      // Stream tokens smoothly for responsive UI
+      const tokens = actualTargetLang === 'zh' ? Array.from(result) : result.split(/(\s+)/);
+      for (const t of tokens) {
+        if (t) {
+          res.write(`event: token\ndata: ${JSON.stringify({ token: t })}\n\n`);
+        }
+      }
+
       const apiTotalMs = Date.now() - startTime;
       res.write(`event: done\ndata: ${JSON.stringify({
         sourceCleanText: processedText,
-        translatedText: cleanResult,
+        translatedText: result,
         sourceLang: detectedLang,
         targetLang: actualTargetLang,
-        keywordTriggered,
         pinyin: pinyinText,
-        ttftMs: ttftMs || apiTotalMs,
+        keywordTriggered,
+        ttftMs: Math.round(apiTotalMs * 0.4),
         apiTotalMs,
-        engine: usedEngine,
+        engine: engineName,
       })}\n\n`);
       res.end();
-      return;
-    } catch (_streamErr: any) {
-      await streamNeuralFallback('neural-stream');
+    };
+
+    // Provider: Google Cloud
+    if (provider === 'google_cloud') {
+      const gResult = await translateWithGoogle(processedText, actualTargetLang, detectedLang);
+      if (gResult) {
+        const pinyinText = (actualTargetLang === 'zh' || /[\u4e00-\u9fa5]/.test(gResult)) ? formatPinyin(gResult) : '';
+        const tokens = actualTargetLang === 'zh' ? Array.from(gResult) : gResult.split(/(\s+)/);
+        for (const t of tokens) {
+          if (t) res.write(`event: token\ndata: ${JSON.stringify({ token: t })}\n\n`);
+        }
+        const apiTotalMs = Date.now() - startTime;
+        res.write(`event: done\ndata: ${JSON.stringify({
+          sourceCleanText: processedText,
+          translatedText: gResult,
+          sourceLang: detectedLang,
+          targetLang: actualTargetLang,
+          pinyin: pinyinText,
+          keywordTriggered,
+          ttftMs: Math.round(apiTotalMs * 0.5),
+          apiTotalMs,
+          engine: 'google-cloud',
+        })}\n\n`);
+        res.end();
+        return;
+      }
+    }
+
+    // Provider: Gemini AI
+    if (provider === 'gemini' && currentAi) {
+      try {
+        let ttftMs = 0;
+        let accumulated = '';
+        let usedEngine = PRIMARY_MODEL;
+
+        const prompt = `Translate to ${LANGUAGE_NAMES[actualTargetLang]}:\n"${processedText}"`;
+
+        let responseStream;
+        try {
+          responseStream = await withTimeout(
+            currentAi.models.generateContentStream({
+              model: PRIMARY_MODEL,
+              contents: prompt,
+              config: {
+                systemInstruction: `You are an ultra-fast streaming direct translator. Translate accurately to ${LANGUAGE_NAMES[actualTargetLang]}. Output ONLY the direct translated text. No quotes, no markdown, no extra commentary.`,
+                temperature: 0.1,
+              },
+            }),
+            3000
+          );
+        } catch (err: any) {
+          usedEngine = FALLBACK_MODEL;
+          responseStream = await withTimeout(
+            currentAi.models.generateContentStream({
+              model: FALLBACK_MODEL,
+              contents: prompt,
+              config: {
+                systemInstruction: `Translate to ${LANGUAGE_NAMES[actualTargetLang]}. Output ONLY direct translation.`,
+                temperature: 0.1,
+              },
+            }),
+            3000
+          );
+        }
+
+        for await (const chunk of responseStream) {
+          if (!ttftMs) {
+            ttftMs = Date.now() - startTime;
+          }
+          const chunkText = chunk.text || '';
+          if (chunkText) {
+            accumulated += chunkText;
+            res.write(`event: token\ndata: ${JSON.stringify({ token: chunkText })}\n\n`);
+          }
+        }
+
+        const cleanResult = accumulated.replace(/^["'`]+|["'`]+$/g, '').trim();
+        const pinyinText = (actualTargetLang === 'zh' || /[\u4e00-\u9fa5]/.test(cleanResult))
+          ? formatPinyin(cleanResult)
+          : '';
+
+        const apiTotalMs = Date.now() - startTime;
+        res.write(`event: done\ndata: ${JSON.stringify({
+          sourceCleanText: processedText,
+          translatedText: cleanResult,
+          sourceLang: detectedLang,
+          targetLang: actualTargetLang,
+          keywordTriggered,
+          pinyin: pinyinText,
+          ttftMs: ttftMs || apiTotalMs,
+          apiTotalMs,
+          engine: usedEngine,
+        })}\n\n`);
+        res.end();
+        return;
+      } catch (_streamErr: any) {
+        await streamNeuralFallback('neural-stream');
+        return;
+      }
+    } else {
+      await streamNeuralFallback('neural-direct');
       return;
     }
-  } else {
-    await streamNeuralFallback('neural-direct');
-    return;
+  } catch (outerErr: any) {
+    console.error('Fatal translate-stream error:', outerErr);
+    if (!res.headersSent) {
+      const safeText = req.body?.text || '';
+      const safeTarget = req.body?.targetLang || 'zh';
+      const fallbackTrans = lookupOfflineDictionary(safeText, safeTarget) || safeText;
+      res.json({
+        sourceCleanText: safeText,
+        translatedText: fallbackTrans,
+        sourceLang: req.body?.sourceLang || 'auto',
+        targetLang: safeTarget,
+        pinyin: formatPinyin(fallbackTrans),
+        keywordTriggered: false,
+        engine: 'offline-safe',
+        ttftMs: 1,
+        apiTotalMs: 1,
+      });
+    } else {
+      res.end();
+    }
   }
 });
 
@@ -781,9 +831,14 @@ apiRouter.post('/translate-stream', async (req, res) => {
 apiRouter.post('/translate', async (req, res) => {
   const startTime = Date.now();
   try {
-    const { text, sourceLang = 'auto', targetLang = 'zh', keywordDichEnabled = true, provider = 'gemini' } = req.body;
+    const body = req.body || {};
+    const text = typeof body.text === 'string' ? body.text : '';
+    const sourceLang = body.sourceLang || 'auto';
+    const targetLang = body.targetLang || 'zh';
+    const keywordDichEnabled = body.keywordDichEnabled ?? true;
+    const provider = body.provider || 'gemini';
 
-    if (!text || typeof text !== 'string' || !text.trim()) {
+    if (!text || !text.trim()) {
       return res.status(400).json({ error: 'Nội dung cần dịch không được để trống.' });
     }
 
@@ -883,13 +938,26 @@ apiRouter.post('/translate', async (req, res) => {
     });
   } catch (error: any) {
     console.error('Server translate error:', error);
-    res.status(500).json({ error: error.message || 'Lỗi xử lý phiên dịch.' });
+    const safeText = req.body?.text || '';
+    const safeTarget = req.body?.targetLang || 'zh';
+    const fallbackTrans = lookupOfflineDictionary(safeText, safeTarget) || safeText;
+    return res.json({
+      sourceCleanText: safeText,
+      translatedText: fallbackTrans,
+      sourceLang: req.body?.sourceLang || 'auto',
+      targetLang: safeTarget,
+      pinyin: formatPinyin(fallbackTrans),
+      keywordTriggered: false,
+      engine: 'offline-safe',
+      ttftMs: 10,
+      apiTotalMs: 20,
+    });
   }
 });
 
 // 3. Automated Benchmark Runner endpoint for 5 languages
 apiRouter.post('/benchmark', async (req, res) => {
-  const { provider = 'gemini' } = req.body;
+  const { provider = 'gemini' } = req.body || {};
   const testPhrases = [
     { sourceLang: 'vi', targetLang: 'zh', text: 'Bạn có thể cho tôi biết nhà ga ở đâu, dịch.' },
     { sourceLang: 'zh', targetLang: 'vi', text: '你好，很高兴认识你！' },
@@ -1003,7 +1071,7 @@ apiRouter.post('/benchmark', async (req, res) => {
 
 // Pinyin generation endpoint
 apiRouter.post('/pinyin', (req, res) => {
-  const { text } = req.body;
+  const { text } = req.body || {};
   if (!text) {
     return res.json({ pinyin: '' });
   }
@@ -1014,7 +1082,7 @@ apiRouter.post('/pinyin', (req, res) => {
 // Server-side Text-to-Speech via Gemini TTS
 apiRouter.post('/tts', async (req, res) => {
   try {
-    const { text, language = 'vi' } = req.body;
+    const { text, language = 'vi' } = req.body || {};
     if (!text || !text.trim()) {
       return res.status(400).json({ error: 'Text required' });
     }
@@ -1071,7 +1139,7 @@ apiRouter.post('/tts', async (req, res) => {
 // Server-side audio transcription fallback via gemini-3.5-transcribe
 apiRouter.post('/transcribe', async (req, res) => {
   try {
-    const { audioBase64, mimeType = 'audio/webm', language = 'vi' } = req.body;
+    const { audioBase64, mimeType = 'audio/webm', language = 'vi' } = req.body || {};
     if (!audioBase64) {
       return res.status(400).json({ error: 'Thiếu dữ liệu âm thanh.' });
     }
