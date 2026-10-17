@@ -1,0 +1,6 @@
+{
+  "name": "EasyTalk Translator",
+  "description": "Website phiên dịch trực tiếp hai chiều 5 ngôn ngữ (Việt, Anh, Trung, Thái, Hàn) với nhận diện giọng nói, Pinyin chuẩn thanh điệu và chế độ giao tiếp trực tiếp.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
