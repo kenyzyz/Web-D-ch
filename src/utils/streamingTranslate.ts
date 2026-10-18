@@ -1,5 +1,6 @@
 import { LanguageCode, ApiProvider, LatencyBreakdown } from '../types/translator';
 import { getChinesePinyin } from './pinyin';
+import { directClientTranslateFallback } from './clientTranslateFallback';
 
 export interface StreamTranslationParams {
   text: string;
@@ -44,18 +45,27 @@ export async function streamTranslate({
   let resolvedSourceLang: LanguageCode = sourceLang === 'auto' ? 'vi' : sourceLang;
   let keywordTriggered = false;
 
+  const customApiKey = (typeof localStorage !== 'undefined' ? localStorage.getItem('easytalk_gemini_key') : '') || '';
+  const requestHeaders: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (customApiKey) {
+    requestHeaders['x-gemini-key'] = customApiKey;
+  }
+
   try {
     if (enableStreaming && typeof fetch !== 'undefined') {
       try {
         const response = await fetch('/api/translate-stream', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: requestHeaders,
           body: JSON.stringify({
             text,
             sourceLang,
             targetLang,
             keywordDichEnabled,
             provider,
+            apiKey: customApiKey,
           }),
         });
 
@@ -185,13 +195,14 @@ export async function streamTranslate({
     try {
       const res = await fetch('/api/translate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: requestHeaders,
         body: JSON.stringify({
           text,
           sourceLang,
           targetLang,
           keywordDichEnabled,
           provider,
+          apiKey: customApiKey,
         }),
       });
 
@@ -200,6 +211,26 @@ export async function streamTranslate({
       }
     } catch (unaryErr) {
       console.warn('Unary translate fetch error:', unaryErr);
+    }
+
+    // Direct in-browser client fallback if backend is unreachable or returned untranslated text
+    if (!data || !data.translatedText || (data.translatedText === text && text.trim().length > 1 && resolvedSourceLang !== targetLang)) {
+      try {
+        const clientFallback = await directClientTranslateFallback(cleanSource, resolvedSourceLang, targetLang);
+        if (clientFallback && clientFallback.text) {
+          data = {
+            sourceCleanText: cleanSource,
+            translatedText: clientFallback.text,
+            sourceLang: resolvedSourceLang,
+            targetLang,
+            pinyin: clientFallback.pinyin || (targetLang === 'zh' ? getChinesePinyin(clientFallback.text) : ''),
+            keywordTriggered,
+            engine: clientFallback.engine || 'client-direct',
+          };
+        }
+      } catch (fallbackErr) {
+        console.warn('Client direct fallback failed:', fallbackErr);
+      }
     }
 
     if (!data) {

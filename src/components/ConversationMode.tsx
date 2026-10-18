@@ -18,6 +18,7 @@ import {
 } from '../utils/speech';
 import { getChinesePinyin } from '../utils/pinyin';
 import { streamTranslate } from '../utils/streamingTranslate';
+import { directClientTranslateFallback } from '../utils/clientTranslateFallback';
 import { 
   Mic, 
   Square, 
@@ -222,15 +223,20 @@ export const ConversationMode: React.FC<ConversationModeProps> = ({
         liveAbortControllerRef.current?.abort();
         liveAbortControllerRef.current = new AbortController();
 
+        const customApiKey = (typeof localStorage !== 'undefined' ? localStorage.getItem('easytalk_gemini_key') : '') || '';
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (customApiKey) headers['x-gemini-key'] = customApiKey;
+
         const response = await fetch('/api/translate', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({
             text: clean,
             sourceLang: srcLang,
             targetLang: tgtLang,
             keywordDichEnabled: false,
             provider: settings.apiProvider,
+            apiKey: customApiKey,
           }),
           signal: liveAbortControllerRef.current.signal,
         });
@@ -241,7 +247,15 @@ export const ConversationMode: React.FC<ConversationModeProps> = ({
             setLiveParallelText(data.translatedText);
             const resolvedPinyin = data.pinyin || (tgtLang === 'zh' ? getChinesePinyin(data.translatedText) : '');
             setLiveParallelPinyin(resolvedPinyin);
+            return;
           }
+        }
+
+        // Fast fallback if backend unreachable
+        const fallback = await directClientTranslateFallback(clean, srcLang, tgtLang);
+        if (fallback?.text) {
+          setLiveParallelText(fallback.text);
+          setLiveParallelPinyin(fallback.pinyin || (tgtLang === 'zh' ? getChinesePinyin(fallback.text) : ''));
         }
       } catch (err: any) {
         if (err.name !== 'AbortError') {

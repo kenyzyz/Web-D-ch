@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { AppSettings, SUPPORTED_LANGUAGES, ApiProvider } from '../types/translator';
 import { 
   X, 
@@ -10,7 +10,14 @@ import {
   Radio, 
   ShieldAlert, 
   Timer, 
-  VolumeX 
+  VolumeX,
+  Key,
+  Eye,
+  EyeOff,
+  CheckCircle2,
+  AlertCircle,
+  RefreshCw,
+  ExternalLink
 } from 'lucide-react';
 
 interface SettingsModalProps {
@@ -26,6 +33,94 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   settings,
   onUpdateSettings,
 }) => {
+  const [geminiKeyInput, setGeminiKeyInput] = useState<string>('');
+  const [showKey, setShowKey] = useState<boolean>(false);
+  const [syncStatus, setSyncStatus] = useState<{ loading: boolean; success?: boolean; message?: string }>({ loading: false });
+  const [serverKeyStatus, setServerKeyStatus] = useState<{ configured: boolean; isCustom: boolean } | null>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      const stored = typeof localStorage !== 'undefined' ? (localStorage.getItem('easytalk_gemini_key') || '') : '';
+      setGeminiKeyInput(stored);
+      fetchServerKeyStatus();
+    }
+  }, [isOpen]);
+
+  const fetchServerKeyStatus = async () => {
+    try {
+      const res = await fetch('/api/config-keys');
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.gemini) {
+          setServerKeyStatus({
+            configured: !!data.gemini.configured,
+            isCustom: !!data.gemini.isCustom,
+          });
+        }
+      }
+    } catch {
+      // offline or silent
+    }
+  };
+
+  const handleSyncKey = async () => {
+    const trimmed = geminiKeyInput.trim();
+    setSyncStatus({ loading: true });
+
+    try {
+      const res = await fetch('/api/config-keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'gemini',
+          apiKey: trimmed,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (res.ok && data.success) {
+        if (typeof localStorage !== 'undefined') {
+          if (trimmed) {
+            localStorage.setItem('easytalk_gemini_key', trimmed);
+          } else {
+            localStorage.removeItem('easytalk_gemini_key');
+          }
+        }
+        setSyncStatus({
+          loading: false,
+          success: true,
+          message: data.message || 'Đã đồng bộ khóa API thành công!',
+        });
+        fetchServerKeyStatus();
+      } else {
+        setSyncStatus({
+          loading: false,
+          success: false,
+          message: data.error || 'Khóa API không hợp lệ hoặc không có kết nối.',
+        });
+      }
+    } catch (err: any) {
+      // If serverless is offline, still save to local client so it can be sent via headers
+      if (trimmed) {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem('easytalk_gemini_key', trimmed);
+        }
+        setSyncStatus({
+          loading: false,
+          success: true,
+          message: 'Đã lưu khóa API trên trình duyệt. Khóa sẽ tự động gửi kèm mỗi lượt dịch!',
+        });
+      } else {
+        setSyncStatus({
+          loading: false,
+          success: false,
+          message: err?.message || 'Lỗi kết nối máy chủ.',
+        });
+      }
+    }
+  };
+
   if (!isOpen) return null;
 
   return (
@@ -41,7 +136,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-full text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors"
+            className="p-1.5 rounded-full text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -49,6 +144,89 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         {/* Modal Content */}
         <div className="p-6 overflow-y-auto space-y-6">
+          {/* Section: API Key Configuration & Sync */}
+          <div className="p-4 rounded-2xl bg-gradient-to-br from-indigo-50/70 via-blue-50/50 to-slate-50 border border-blue-100">
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <div className="flex items-center gap-1.5 font-bold text-sm text-slate-900">
+                <Key className="w-4 h-4 text-blue-600" />
+                <span>Khóa API Google Gemini</span>
+              </div>
+              {serverKeyStatus?.configured ? (
+                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-100/80 px-2 py-0.5 rounded-full">
+                  <CheckCircle2 className="w-3 h-3" />
+                  Đã kết nối
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-700 bg-amber-100/80 px-2 py-0.5 rounded-full">
+                  <AlertCircle className="w-3 h-3" />
+                  Chưa cấu hình
+                </span>
+              )}
+            </div>
+
+            <p className="text-xs text-slate-600 mb-3">
+              Dán khóa Gemini API (bắt đầu bằng <code>AIzaSy...</code>) tại đây để đồng bộ ngay lập tức cho trang web.
+            </p>
+
+            <div className="flex items-center gap-2">
+              <div className="relative flex-1">
+                <input
+                  type={showKey ? 'text' : 'password'}
+                  placeholder="Nhập hoặc dán Gemini API Key (AIzaSy...)"
+                  value={geminiKeyInput}
+                  onChange={(e) => setGeminiKeyInput(e.target.value)}
+                  className="w-full pl-3 pr-9 py-2 text-xs rounded-xl border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowKey(!showKey)}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                >
+                  {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleSyncKey}
+                disabled={syncStatus.loading}
+                className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs transition-colors flex items-center gap-1.5 shrink-0 cursor-pointer disabled:opacity-50 shadow-xs"
+              >
+                {syncStatus.loading ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Đang kiểm tra...</span>
+                  </>
+                ) : (
+                  <>
+                    <Zap className="w-3.5 h-3.5" />
+                    <span>Đồng bộ & Lưu</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+            {/* Sync Feedback Message */}
+            {syncStatus.message && (
+              <div className={`mt-2.5 p-2 rounded-xl text-xs flex items-start gap-1.5 ${
+                syncStatus.success ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'
+              }`}>
+                {syncStatus.success ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0 mt-0.5 text-emerald-600" /> : <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-rose-600" />}
+                <span>{syncStatus.message}</span>
+              </div>
+            )}
+
+            {/* Vercel hint */}
+            <div className="mt-2.5 text-[11px] text-slate-500 bg-white/70 p-2 rounded-lg border border-slate-200/60 space-y-1">
+              <div className="font-semibold text-slate-700 flex items-center gap-1">
+                <span>💡 Lưu ý khi triển khai trên Vercel:</span>
+              </div>
+              <p>
+                Nếu bạn đã thêm biến môi trường <code>GEMINI_API_KEY</code> trên Vercel, hãy vào <strong>Deployments &rarr; Bấm dấu 3 chấm &rarr; Redeploy</strong> để Vercel áp dụng biến mới. Hoặc bạn chỉ cần dán khóa vào ô phía trên rồi bấm <strong>Đồng bộ & Lưu</strong> để sử dụng ngay!
+              </p>
+            </div>
+          </div>
+
           {/* Requirement 16: 3 API Provider Buttons / Radios */}
           <div>
             <div className="flex items-center gap-1.5 font-semibold text-sm text-slate-900 mb-1">
@@ -56,7 +234,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <span>Nhà cung cấp API dịch thuật (3 Engine)</span>
             </div>
             <p className="text-xs text-slate-500 mb-2.5">
-              Khóa API được lưu trữ và bảo vệ an toàn tại backend (.env / Secrets), tuyệt đối không để lộ ở client.
+              Hệ thống tự động chuyển tiếp mượt mà nếu máy chủ bận hoặc không có mạng.
             </p>
 
             <div className="space-y-2">

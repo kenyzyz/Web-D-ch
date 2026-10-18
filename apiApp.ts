@@ -8,22 +8,28 @@ dotenv.config();
 const app = express();
 
 // Safe body parsing middleware supporting both Vercel serverless and standalone Express
-app.use((req, res, next) => {
-  // If req.body is already parsed into an object (e.g. by Vercel serverless runtime)
-  if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+app.use((req: any, res: any, next: any) => {
+  // 1. If Vercel or any upstream runtime has already provided req.body
+  if (req.body !== undefined && req.body !== null) {
+    if (typeof req.body === 'string' && req.body.trim().startsWith('{')) {
+      try {
+        req.body = JSON.parse(req.body);
+      } catch (e) {
+        // keep as is
+      }
+    }
     return next();
   }
-  if (typeof req.body === 'string' && req.body.trim().startsWith('{')) {
-    try {
-      req.body = JSON.parse(req.body);
-      return next();
-    } catch (e) {
-      // not JSON
-    }
+
+  // 2. If stream has already ended, do not hang on express.json
+  if (req.readableEnded || (req._readableState && req._readableState.ended)) {
+    req.body = req.body || {};
+    return next();
   }
+
+  // 3. Otherwise safely parse JSON
   express.json({ limit: '25mb' })(req, res, (err) => {
     if (err) {
-      console.warn('express.json warning:', err.message);
       req.body = req.body || {};
     }
     next();
@@ -36,7 +42,7 @@ app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, x-gemini-key');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
@@ -44,14 +50,38 @@ app.use((req, res, next) => {
 });
 
 // Initialize GoogleGenAI SDK on server side if GEMINI_API_KEY is available
-let systemGeminiKey = process.env.GEMINI_API_KEY || '';
+let systemGeminiKey = (
+  process.env.GEMINI_API_KEY ||
+  process.env.GOOGLE_API_KEY ||
+  process.env.GOOGLE_GENAI_API_KEY ||
+  process.env.VITE_GEMINI_API_KEY ||
+  process.env.VITE_GOOGLE_API_KEY ||
+  process.env.API_KEY ||
+  ''
+).trim();
 let customGeminiKey = '';
-let googleCloudApiKey = process.env.GOOGLE_CLOUD_TRANSLATE_API_KEY || process.env.GOOGLE_TRANSLATE_API_KEY || '';
+let googleCloudApiKey = (process.env.GOOGLE_CLOUD_TRANSLATE_API_KEY || process.env.GOOGLE_TRANSLATE_API_KEY || '').trim();
 let customGoogleKey = '';
 let customOtherEndpoint = '';
 
-function getActiveGeminiAI() {
-  const key = customGeminiKey || systemGeminiKey || process.env.GEMINI_API_KEY || '';
+function getResolvedGeminiKey(req?: any): string {
+  const reqHeaderKey = (req?.headers?.['x-gemini-key'] as string) || '';
+  const reqBodyKey = (req?.body?.apiKey as string) || '';
+  const envKey = (
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.GOOGLE_GENAI_API_KEY ||
+    process.env.VITE_GEMINI_API_KEY ||
+    process.env.VITE_GOOGLE_API_KEY ||
+    process.env.API_KEY ||
+    ''
+  ).trim();
+
+  return (reqHeaderKey || reqBodyKey || customGeminiKey || envKey || systemGeminiKey || '').trim();
+}
+
+function getActiveGeminiAI(req?: any) {
+  const key = getResolvedGeminiKey(req);
   if (!key) return null;
   return new GoogleGenAI({
     apiKey: key,
@@ -589,12 +619,32 @@ apiRouter.post('/config-keys', async (req, res) => {
 
       try {
         const testAi = new GoogleGenAI({ apiKey: keyToTest });
-        await testAi.models.generateContent({
-          model: PRIMARY_MODEL,
-          contents: 'ping',
-        });
-        customGeminiKey = keyToTest;
-        return res.json({ success: true, message: 'Khóa API Gemini hợp lệ và đã được kích hoạt an toàn tại backend!' });
+        // Try candidate models in order: PRIMARY -> 2.5-flash -> 2.0-flash -> FALLBACK
+        const modelsToTest = [PRIMARY_MODEL, 'gemini-2.5-flash', 'gemini-2.0-flash', FALLBACK_MODEL];
+        let testedSuccess = false;
+        let lastErr = '';
+
+        for (const m of modelsToTest) {
+          try {
+            await testAi.models.generateContent({
+              model: m,
+              contents: 'ping',
+            });
+            testedSuccess = true;
+            break;
+          } catch (mErr: any) {
+            lastErr = mErr?.message || '';
+          }
+        }
+
+        if (testedSuccess) {
+          customGeminiKey = keyToTest;
+          systemGeminiKey = keyToTest;
+          process.env.GEMINI_API_KEY = keyToTest;
+          return res.json({ success: true, message: 'Khóa API Gemini hợp lệ và đã được kích hoạt an toàn tại backend!' });
+        } else {
+          return res.status(400).json({ error: lastErr || 'Khóa API Gemini không hợp lệ hoặc đã hết hạn ngạch.' });
+        }
       } catch (testErr: any) {
         return res.status(400).json({ error: testErr?.message || 'Khóa API Gemini không hợp lệ hoặc đã hết hạn ngạch.' });
       }
@@ -661,7 +711,7 @@ apiRouter.post('/translate-stream', async (req, res) => {
       provider,
     })}\n\n`);
 
-    const currentAi = getActiveGeminiAI();
+    const currentAi = getActiveGeminiAI(req);
 
     // Helper to stream full fallback tokens with high semantic fidelity for long sentences
     const streamNeuralFallback = async (engineName: string) => {
@@ -856,7 +906,7 @@ apiRouter.post('/translate', async (req, res) => {
     let translatedText = '';
     let pinyinText = '';
     let engineUsed = 'neural-direct';
-    const currentAi = getActiveGeminiAI();
+    const currentAi = getActiveGeminiAI(req);
 
     // Provider: Google Cloud
     if (provider === 'google_cloud') {
